@@ -41,7 +41,6 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.logger import logger
 from fastapi.responses import JSONResponse, ORJSONResponse
 from fastapi.staticfiles import StaticFiles
-from google.protobuf.json_format import MessageToDict
 from prometheus_client import Gauge, start_http_server
 from pydantic import BaseModel
 
@@ -53,6 +52,7 @@ from feast.errors import (
     FeastError,
 )
 from feast.feast_object import FeastObject
+from feast.feature_server_utils import response_to_dict_fast
 from feast.feature_view_utils import get_feature_view_from_feature_store
 from feast.permissions.action import WRITE, AuthzedAction
 from feast.permissions.security_manager import assert_permissions
@@ -341,13 +341,7 @@ def get_app(
                 lambda: store.get_online_features(**read_params)  # type: ignore
             )
 
-        # Convert Protobuf to dict, then use ORJSONResponse for faster JSON serialization
-        response_dict = await run_in_threadpool(
-            MessageToDict,
-            response.proto,
-            preserving_proto_field_name=True,
-            float_precision=18,
-        )
+        response_dict = await run_in_threadpool(response_to_dict_fast, response.proto)
         return ORJSONResponse(content=response_dict)
 
     @app.post(
@@ -376,13 +370,7 @@ def get_app(
                 lambda: store.retrieve_online_documents(**read_params)  # type: ignore
             )
 
-        # Convert Protobuf to dict, then use ORJSONResponse for faster JSON serialization
-        response_dict = await run_in_threadpool(
-            MessageToDict,
-            response.proto,
-            preserving_proto_field_name=True,
-            float_precision=18,
-        )
+        response_dict = await run_in_threadpool(response_to_dict_fast, response.proto)
         return ORJSONResponse(content=response_dict)
 
     @app.post("/push", dependencies=[Depends(inject_user_details)])
