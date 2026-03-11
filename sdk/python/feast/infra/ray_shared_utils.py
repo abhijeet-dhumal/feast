@@ -265,20 +265,27 @@ def deduplicate_by_keys_and_timestamp(
         return deduplicate_batch(data)
 
 
-def broadcast_join(
-    entity_ds: Dataset,
-    feature_df: pd.DataFrame,
-    join_keys: List[str],
-    timestamp_field: str,
-    requested_feats: List[str],
-    full_feature_names: bool = False,
-    feature_view_name: Optional[str] = None,
-    original_join_keys: Optional[List[str]] = None,
-) -> Dataset:
-    import ray
+class _BroadcastJoinProcessor:
+    """Callable class for broadcast join - avoids ray.put() issues in client mode."""
+    
+    def __init__(self, feature_df, join_keys, timestamp_field, requested_feats,
+                 full_feature_names, feature_view_name, original_join_keys):
+        self.feature_df = feature_df
+        self.join_keys = join_keys
+        self.timestamp_field = timestamp_field
+        self.requested_feats = requested_feats
+        self.full_feature_names = full_feature_names
+        self.feature_view_name = feature_view_name
+        self.original_join_keys = original_join_keys
 
-    def join_batch_with_features(batch: pd.DataFrame) -> pd.DataFrame:
-        features = ray.get(feature_ref)
+    def __call__(self, batch: pd.DataFrame) -> pd.DataFrame:
+        features = self.feature_df
+        join_keys = self.join_keys
+        timestamp_field = self.timestamp_field
+        requested_feats = self.requested_feats
+        full_feature_names = self.full_feature_names
+        feature_view_name = self.feature_view_name
+        original_join_keys = self.original_join_keys
         if original_join_keys:
             feature_join_keys = original_join_keys
             entity_join_keys = join_keys
@@ -400,8 +407,23 @@ def broadcast_join(
                     result = result.drop(columns=[feat])
         return result
 
-    feature_ref = ray.put(feature_df)
-    return entity_ds.map_batches(join_batch_with_features, batch_format="pandas")
+
+def broadcast_join(
+    entity_ds: Dataset,
+    feature_df: pd.DataFrame,
+    join_keys: List[str],
+    timestamp_field: str,
+    requested_feats: List[str],
+    full_feature_names: bool = False,
+    feature_view_name: Optional[str] = None,
+    original_join_keys: Optional[List[str]] = None,
+) -> Dataset:
+    """Broadcast join using class-based processor (avoids ray.put() in client mode)."""
+    processor = _BroadcastJoinProcessor(
+        feature_df, join_keys, timestamp_field, requested_feats,
+        full_feature_names, feature_view_name, original_join_keys
+    )
+    return entity_ds.map_batches(processor, batch_format="pandas")
 
 
 def distributed_windowed_join(

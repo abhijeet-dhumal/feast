@@ -308,11 +308,12 @@ class CodeFlareRayWrapper:
             raise
 
     # Ray Data API methods - wrapped in @ray.remote to execute on cluster workers
+    # Using num_cpus=0 to prevent resource deadlock with nested Ray Data tasks
     def read_parquet(self, path: Union[str, List[str]], **kwargs) -> Any:
         """Read parquet files - runs remotely on KubeRay cluster workers."""
         from feast.infra.ray_shared_utils import RemoteDatasetProxy
 
-        @ray.remote
+        @ray.remote(num_cpus=0, num_gpus=0)
         def _remote_read_parquet(file_path, read_kwargs):
             import ray
 
@@ -324,7 +325,7 @@ class CodeFlareRayWrapper:
         """Read CSV files - runs remotely on KubeRay cluster workers."""
         from feast.infra.ray_shared_utils import RemoteDatasetProxy
 
-        @ray.remote
+        @ray.remote(num_cpus=0, num_gpus=0)
         def _remote_read_csv(file_path, read_kwargs):
             import ray
 
@@ -336,7 +337,7 @@ class CodeFlareRayWrapper:
         """Create dataset from pandas DataFrame - runs remotely on KubeRay cluster workers."""
         from feast.infra.ray_shared_utils import RemoteDatasetProxy
 
-        @ray.remote
+        @ray.remote(num_cpus=0, num_gpus=0)
         def _remote_from_pandas(dataframe):
             import ray
 
@@ -348,7 +349,7 @@ class CodeFlareRayWrapper:
         """Create dataset from Arrow table - runs remotely on KubeRay cluster workers."""
         from feast.infra.ray_shared_utils import RemoteDatasetProxy
 
-        @ray.remote
+        @ray.remote(num_cpus=0, num_gpus=0)
         def _remote_from_arrow(arrow_table):
             import ray
 

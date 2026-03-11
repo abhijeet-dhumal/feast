@@ -600,18 +600,20 @@ class RayDataProcessor:
         feature_view_name: Optional[str] = None,
         original_join_keys: Optional[List[str]] = None,
     ) -> Dataset:
-        """Perform broadcast join for small feature datasets."""
-
-        # Put feature data in Ray object store for efficient broadcasting
-        feature_ref = ray.put(feature_df)
+        """Perform broadcast join for small feature datasets.
+        
+        Uses closure-based approach instead of ray.put() to avoid
+        serialization issues in Ray client mode.
+        """
+        # Capture feature_df in closure - avoids ray.put() issues in client mode
+        _feature_df = feature_df
+        _enable_logging = getattr(self.resource_manager.config, "enable_ray_logging", False)
 
         def join_batch_with_features(batch: pd.DataFrame) -> pd.DataFrame:
             """Join a batch with broadcast feature data."""
-            features = ray.get(feature_ref)
+            features = _feature_df
+            enable_logging = _enable_logging
 
-            enable_logging = getattr(
-                self.resource_manager.config, "enable_ray_logging", False
-            )
             if enable_logging:
                 logger.info(
                     f"Processing feature view {feature_view_name} with join keys {join_keys}"

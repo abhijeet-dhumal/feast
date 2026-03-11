@@ -155,12 +155,12 @@ class RayJoinNode(DAGNode):
 
         if is_aggregated:
             # For aggregated features, do simple join on entity keys
-            feature_df = feature_dataset.to_pandas()
-            feature_ref = ray.put(feature_df)
+            # Use closure instead of ray.put() to avoid client mode issues
+            _feature_df = feature_dataset.to_pandas()
 
             @safe_batch_processor
             def join_with_aggregated_features(batch: pd.DataFrame) -> pd.DataFrame:
-                features = ray.get(feature_ref)
+                features = _feature_df
                 if join_keys:
                     result = pd.merge(
                         batch,
