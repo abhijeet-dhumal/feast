@@ -228,6 +228,55 @@ class StandardRayWrapper:
         return ray.data.from_arrow(table)
 
 
+class RemoteClientRayWrapper:
+    """Wrapper for Ray operations in client mode (ray://) using RemoteDatasetProxy.
+    
+    Ray Data operations don't work directly from Ray client mode because they
+    need core_worker which isn't available. This wrapper executes all operations
+    inside the cluster using @ray.remote tasks and returns RemoteDatasetProxy.
+    """
+
+    def read_parquet(self, path: Union[str, List[str]], **kwargs) -> Any:
+        """Read parquet files - runs remotely on cluster workers."""
+        from feast.infra.ray_shared_utils import RemoteDatasetProxy
+
+        @ray.remote(num_cpus=0, num_gpus=0)
+        def _remote_read_parquet(file_path, read_kwargs):
+            return ray.data.read_parquet(file_path, **read_kwargs)
+
+        return RemoteDatasetProxy(_remote_read_parquet.remote(path, kwargs))
+
+    def read_csv(self, path: Union[str, List[str]], **kwargs) -> Any:
+        """Read CSV files - runs remotely on cluster workers."""
+        from feast.infra.ray_shared_utils import RemoteDatasetProxy
+
+        @ray.remote(num_cpus=0, num_gpus=0)
+        def _remote_read_csv(file_path, read_kwargs):
+            return ray.data.read_csv(file_path, **read_kwargs)
+
+        return RemoteDatasetProxy(_remote_read_csv.remote(path, kwargs))
+
+    def from_pandas(self, df: Any) -> Any:
+        """Create dataset from pandas DataFrame - runs remotely on cluster workers."""
+        from feast.infra.ray_shared_utils import RemoteDatasetProxy
+
+        @ray.remote(num_cpus=0, num_gpus=0)
+        def _remote_from_pandas(dataframe):
+            return ray.data.from_pandas(dataframe)
+
+        return RemoteDatasetProxy(_remote_from_pandas.remote(df))
+
+    def from_arrow(self, table: Any) -> Any:
+        """Create dataset from Arrow table - runs remotely on cluster workers."""
+        from feast.infra.ray_shared_utils import RemoteDatasetProxy
+
+        @ray.remote(num_cpus=0, num_gpus=0)
+        def _remote_from_arrow(arrow_table):
+            return ray.data.from_arrow(arrow_table)
+
+        return RemoteDatasetProxy(_remote_from_arrow.remote(table))
+
+
 class CodeFlareRayWrapper:
     """Wrapper for Ray operations on KubeRay clusters using CodeFlare SDK."""
 
@@ -627,18 +676,46 @@ def ensure_ray_initialized(
         raise
 
 
-def get_ray_wrapper() -> Union[StandardRayWrapper, CodeFlareRayWrapper]:
+def _is_ray_client_mode() -> bool:
+    """Check if Ray is running in client mode (connected via ray://)."""
+    try:
+        # Check if connected via Ray client
+        if hasattr(ray, '_private') and hasattr(ray._private, 'client_mode_hook'):
+            from ray._private.client_mode_hook import is_client_mode_enabled
+            return is_client_mode_enabled()
+    except Exception:
+        pass
+    
+    # Fallback: check if we have a core_worker (absent in client mode)
+    try:
+        if hasattr(ray, '_private') and hasattr(ray._private, 'worker'):
+            worker = ray._private.worker.global_worker
+            return not hasattr(worker, 'core_worker') or worker.core_worker is None
+    except Exception:
+        pass
+    
+    return False
+
+
+def get_ray_wrapper() -> Union[StandardRayWrapper, CodeFlareRayWrapper, RemoteClientRayWrapper]:
     """
     Get the appropriate Ray wrapper based on current initialization mode.
 
     Returns:
-        StandardRayWrapper for local/remote modes, CodeFlareRayWrapper for KubeRay mode
+        StandardRayWrapper for local modes
+        RemoteClientRayWrapper for remote client modes (ray://)
+        CodeFlareRayWrapper for KubeRay mode
     """
     global _ray_wrapper
 
     if _ray_wrapper is None:
-        # Return a standard Ray wrapper for local/remote modes
-        _ray_wrapper = StandardRayWrapper()
+        # Check if we're in client mode (connected to remote cluster via ray://)
+        if _is_ray_client_mode():
+            logger.info("Ray client mode detected - using RemoteClientRayWrapper")
+            _ray_wrapper = RemoteClientRayWrapper()
+        else:
+            # Standard wrapper for local/driver mode
+            _ray_wrapper = StandardRayWrapper()
 
     return _ray_wrapper
 
