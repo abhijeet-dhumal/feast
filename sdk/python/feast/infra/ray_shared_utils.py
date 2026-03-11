@@ -139,6 +139,46 @@ class RemoteDatasetProxy:
         result_ref = _remote_size_bytes.remote(self._dataset_ref)
         return ray.get(result_ref)
 
+    def repartition(self, num_blocks: int) -> "RemoteDatasetProxy":
+        """Execute repartition remotely on cluster workers."""
+
+        @ray.remote
+        def _remote_repartition(dataset, blocks):
+            return dataset.repartition(num_blocks=blocks)
+
+        new_ref = _remote_repartition.remote(self._dataset_ref, num_blocks)
+        return RemoteDatasetProxy(new_ref)
+
+    def random_shuffle(self) -> "RemoteDatasetProxy":
+        """Execute random_shuffle remotely on cluster workers."""
+
+        @ray.remote
+        def _remote_random_shuffle(dataset):
+            return dataset.random_shuffle()
+
+        new_ref = _remote_random_shuffle.remote(self._dataset_ref)
+        return RemoteDatasetProxy(new_ref)
+
+    def num_blocks(self) -> int:
+        """Execute num_blocks remotely and return result."""
+
+        @ray.remote
+        def _remote_num_blocks(dataset):
+            return dataset.num_blocks()
+
+        result_ref = _remote_num_blocks.remote(self._dataset_ref)
+        return ray.get(result_ref)
+
+    def write_parquet(self, path: str, **kwargs) -> None:
+        """Execute write_parquet remotely on cluster workers."""
+
+        @ray.remote
+        def _remote_write_parquet(dataset, write_path, write_kwargs):
+            dataset.write_parquet(write_path, **write_kwargs)
+
+        result_ref = _remote_write_parquet.remote(self._dataset_ref, path, kwargs)
+        ray.get(result_ref)
+
     def __getattr__(self, name):
         """Catch any method calls that we haven't explicitly implemented."""
         raise AttributeError(f"RemoteDatasetProxy has no attribute '{name}'")
