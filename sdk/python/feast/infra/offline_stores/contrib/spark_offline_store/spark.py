@@ -115,13 +115,28 @@ class SparkOfflineStore(OfflineStore):
         if created_timestamp_column:
             timestamps.append(created_timestamp_column)
         timestamp_desc_string = " DESC, ".join(timestamps) + " DESC"
-        (fields_with_aliases, aliases) = _get_fields_with_aliases(
-            fields=join_key_columns + feature_name_columns + timestamps,
-            field_mappings=data_source.field_mapping,
-        )
 
-        fields_as_string = ", ".join(fields_with_aliases)
-        aliases_as_string = ", ".join(aliases)
+        if feature_name_columns:
+            (fields_with_aliases, aliases) = _get_fields_with_aliases(
+                fields=join_key_columns + feature_name_columns + timestamps,
+                field_mappings=data_source.field_mapping,
+            )
+            fields_as_string = ", ".join(fields_with_aliases)
+            aliases_as_string = ", ".join(aliases)
+        else:
+            # Empty feature_name_columns signals "read all source columns".
+            # Used by BatchFeatureView with TransformationMode.PYTHON/ray/pandas.
+            # Still apply field_mapping aliases for join keys and timestamps so
+            # downstream nodes find the mapped names.
+            (key_ts_aliases, _) = _get_fields_with_aliases(
+                fields=join_key_columns + timestamps,
+                field_mappings=data_source.field_mapping,
+            )
+            mapping_extras = [e for e in key_ts_aliases if " AS " in e]
+            extra_str = (", " + ", ".join(mapping_extras)) if mapping_extras else ""
+            fields_as_string = f"*{extra_str}"
+            # Outer SELECT uses * — feast_row_ is present but ignored by downstream.
+            aliases_as_string = "*"
 
         date_partition_column = data_source.date_partition_column
         date_partition_column_format = data_source.date_partition_column_format
@@ -387,12 +402,28 @@ class SparkOfflineStore(OfflineStore):
         timestamp_fields = [timestamp_field]
         if created_timestamp_column:
             timestamp_fields.append(created_timestamp_column)
-        (fields_with_aliases, aliases) = _get_fields_with_aliases(
-            fields=join_key_columns + feature_name_columns + timestamp_fields,
-            field_mappings=data_source.field_mapping,
-        )
 
-        fields_with_alias_string = ", ".join(fields_with_aliases)
+        if feature_name_columns:
+            (fields_with_aliases, _) = _get_fields_with_aliases(
+                fields=join_key_columns + feature_name_columns + timestamp_fields,
+                field_mappings=data_source.field_mapping,
+            )
+            fields_with_alias_string = ", ".join(fields_with_aliases)
+        else:
+            # Empty feature_name_columns signals "read all source columns".
+            # Used by BatchFeatureView with TransformationMode.PYTHON/ray/pandas where
+            # the UDF computes output features from raw input — don't project upfront.
+            # Still apply field_mapping aliases for join keys and timestamps so
+            # downstream nodes (SparkFilterNode, SparkDedupNode) find the mapped names.
+            (key_ts_aliases, _) = _get_fields_with_aliases(
+                fields=join_key_columns + timestamp_fields,
+                field_mappings=data_source.field_mapping,
+            )
+            mapping_extras = [e for e in key_ts_aliases if " AS " in e]
+            if mapping_extras:
+                fields_with_alias_string = "*, " + ", ".join(mapping_extras)
+            else:
+                fields_with_alias_string = "*"
 
         from_expression = data_source.get_table_query_string()
         timestamp_filter = get_timestamp_filter_sql(
