@@ -115,7 +115,7 @@ def map_in_arrow(
                 for entity in feature_view.entity_columns
             }
 
-            batch_size = repo_config.materialization_config.online_write_batch_size
+            batch_size = getattr(repo_config.materialization_config, "online_write_batch_size", None)
             # Single batch if None (backward compatible), otherwise use configured batch_size
             sub_batches = (
                 [table]
@@ -171,7 +171,7 @@ def map_in_pandas(iterator, serialized_artifacts: SerializedArtifacts):
             for entity in feature_view.entity_columns
         }
 
-        batch_size = repo_config.materialization_config.online_write_batch_size
+        batch_size = getattr(repo_config.materialization_config, "online_write_batch_size", None)
         # Single batch if None (backward compatible), otherwise use configured batch_size
         sub_batches = (
             [table]
