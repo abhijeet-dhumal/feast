@@ -90,6 +90,22 @@ def get_or_create_new_spark_session(
             )
 
         spark_session = spark_builder.getOrCreate()
+
+    # Apply SQL-level configs even when reusing an existing session.
+    # SparkSession.getActiveSession() / getOrCreate() returns the existing session
+    # without applying new spark_config overrides from the caller (e.g. batch_engine
+    # configs like spark.sql.sources.useV1SourceList are silently dropped).
+    # SparkContext-level keys (master, k8s.*, executor.*) can't change post-creation —
+    # only spark.sql.* and spark.hadoop.* are safe to set dynamically.
+    if spark_config:
+        _RUNTIME_PREFIXES = ("spark.sql.", "spark.hadoop.")
+        for k, v in spark_config.items():
+            if any(k.startswith(p) for p in _RUNTIME_PREFIXES):
+                try:
+                    spark_session.conf.set(k, v)
+                except Exception:
+                    pass
+
     spark_session.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
     return spark_session
 
