@@ -205,6 +205,8 @@ def map_in_pandas(iterator, serialized_artifacts: SerializedArtifacts):
                 lambda x: None,
             )
 
-    yield pd.DataFrame(
-        [pd.Series(range(1, 2))]
-    )  # dummy result because mapInPandas needs to return something
+    # mapInPandas requires at least one yielded DataFrame matching the declared
+    # return schema ("status int").  pd.DataFrame([pd.Series(range(1,2))]) creates
+    # a column named 0 (integer), not "status", which fails schema validation in
+    # ArrowStreamPandasUDFSerializer._create_array with 'list has no .dtype'.
+    yield pd.DataFrame({"status": [0]})
