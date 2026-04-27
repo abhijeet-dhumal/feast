@@ -32,7 +32,11 @@ from feast.infra.compute_engines.dag.context import ColumnInfo, ExecutionContext
 from feast.infra.compute_engines.dag.model import DAGFormat
 from feast.infra.compute_engines.dag.node import DAGNode
 from feast.infra.compute_engines.dag.value import DAGValue
-from feast.infra.compute_engines.spark.utils import map_in_arrow
+from feast.infra.compute_engines.spark.utils import (
+    map_in_arrow,
+    write_to_offline_store,
+    write_to_online_store,
+)
 from feast.infra.compute_engines.utils import (
     create_offline_store_retrieval_job,
 )
@@ -573,20 +577,22 @@ class SparkWriteNode(DAGNode):
         )
 
         # ✅ 1. Write to online store if online enabled
+        #
+        # foreachPartition instead of mapInArrow: mapInArrow triggered
+        # ArrowStreamPandasUDFSerializer (instead of ArrowStreamUDFSerializer)
+        # for non-empty partitions when a WindowGroupLimitExec node was
+        # immediately upstream in the plan, causing:
+        #     AttributeError: 'list' object has no attribute 'dtype'
+        # foreachPartition uses Python pickle serialization (no Arrow UDF
+        # bridge) which avoids the issue entirely.
         if self.feature_view.online:
-            spark_df.mapInArrow(
-                lambda x: map_in_arrow(x, serialized_artifacts, mode="online"),
-                spark_df.schema,
-            ).count()
+            write_to_online_store(spark_df, serialized_artifacts)
 
         # ✅ 2. Write to offline store if offline enabled
         if self.feature_view.offline:
             if not isinstance(self.feature_view.batch_source, SparkSource):
-                spark_df.mapInArrow(
-                    lambda x: map_in_arrow(x, serialized_artifacts, mode="offline"),
-                    spark_df.schema,
-                ).count()
-            # Directly write spark df to spark offline store without using mapInArrow
+                write_to_offline_store(spark_df, serialized_artifacts)
+            # Directly write spark df to spark offline store without using foreachPartition
             else:
                 dest_path = self.feature_view.batch_source.path
                 file_format = self.feature_view.batch_source.file_format

@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Dict, Iterable, Literal, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, Literal, Optional
 
 import pandas as pd
 import pyarrow
@@ -10,6 +10,9 @@ from pyspark.sql import SparkSession
 
 from feast.infra.common.serde import SerializedArtifacts
 from feast.utils import _convert_arrow_to_proto, _run_pyarrow_field_mapping
+
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +161,125 @@ def map_in_arrow(
             )
 
         yield batch
+
+
+def write_to_online_store(
+    spark_df: "DataFrame",
+    serialized_artifacts: SerializedArtifacts,
+) -> None:
+    """Write a Spark DataFrame to the online store using foreachPartition.
+
+    Replaces the previous ``spark_df.mapInArrow(map_in_arrow, schema).count()``
+    pattern.  That pattern consistently triggered ``ArrowStreamPandasUDFSerializer``
+    on executor pods (instead of the expected ``ArrowStreamUDFSerializer``) for
+    non-empty partitions, producing::
+
+        AttributeError: 'list' object has no attribute 'dtype'
+
+    Root cause: when the physical plan contains a WindowGroupLimitExec node
+    immediately upstream of a ``MapInArrowExec``, Spark 3.5 routes the Python
+    worker through the pandas UDF serializer branch regardless of the declared
+    ``SQL_MAP_ARROW_ITER_UDF`` eval-type.
+
+    ``foreachPartition`` uses Python's pickle serialiser for Row objects – no
+    Arrow UDF bridge involved – so the issue does not arise.  Each partition is
+    reconstructed into an Arrow table using the declared DataFrame schema before
+    the proto conversion, preserving all column types (including list<float32>
+    for embedding vectors).
+    """
+    from pyspark.sql.pandas.types import to_arrow_schema
+
+    df_schema = spark_df.schema  # captured in closure; picklable
+
+    def _write_partition(rows):  # type: ignore[type-arg]
+        rows_list = list(rows)
+        if not rows_list:
+            return
+
+        import pyarrow as pa
+        from feast.utils import _convert_arrow_to_proto
+
+        pdf = pd.DataFrame([r.asDict(recursive=True) for r in rows_list])
+        arrow_schema = to_arrow_schema(df_schema)
+        table = pa.Table.from_pandas(pdf, schema=arrow_schema, preserve_index=False)
+
+        (
+            feature_view,
+            online_store,
+            _,
+            repo_config,
+        ) = serialized_artifacts.unserialize()
+
+        join_key_to_value_type = {
+            entity.name: entity.dtype.to_value_type()
+            for entity in feature_view.entity_columns
+        }
+
+        batch_size = getattr(
+            repo_config.materialization_config, "online_write_batch_size", None
+        )
+        if batch_size is None:
+            sub_tables = [table]
+        else:
+            sub_tables = [
+                table.slice(offset, min(batch_size, len(table) - offset))
+                for offset in range(0, len(table), batch_size)
+            ]
+
+        for sub_table in sub_tables:
+            rows_to_write = _convert_arrow_to_proto(
+                sub_table, feature_view, join_key_to_value_type
+            )
+            online_store.online_write_batch(
+                config=repo_config,
+                table=feature_view,
+                data=rows_to_write,
+                progress=lambda x: None,
+            )
+
+    spark_df.foreachPartition(_write_partition)
+
+
+def write_to_offline_store(
+    spark_df: "DataFrame",
+    serialized_artifacts: SerializedArtifacts,
+) -> None:
+    """Write a Spark DataFrame to the offline store using foreachPartition.
+
+    Same motivation as ``write_to_online_store`` – avoids the
+    ``ArrowStreamPandasUDFSerializer`` issue that plagued the previous
+    ``mapInArrow`` implementation.
+    """
+    from pyspark.sql.pandas.types import to_arrow_schema
+
+    df_schema = spark_df.schema
+
+    def _write_partition(rows):  # type: ignore[type-arg]
+        rows_list = list(rows)
+        if not rows_list:
+            return
+
+        import pyarrow as pa
+
+        pdf = pd.DataFrame([r.asDict(recursive=True) for r in rows_list])
+        arrow_schema = to_arrow_schema(df_schema)
+        table = pa.Table.from_pandas(pdf, schema=arrow_schema, preserve_index=False)
+
+        (
+            feature_view,
+            _,
+            offline_store,
+            repo_config,
+        ) = serialized_artifacts.unserialize()
+
+        offline_store.offline_write_batch(
+            config=repo_config,
+            feature_view=feature_view,
+            table=table,
+            progress=lambda x: None,
+        )
+
+    spark_df.foreachPartition(_write_partition)
 
 
 def map_in_pandas(iterator, serialized_artifacts: SerializedArtifacts):

@@ -19,6 +19,7 @@ from feast.infra.compute_engines.spark.utils import (
     _ensure_s3a_event_log_dir,
     get_or_create_new_spark_session,
     map_in_pandas,
+    write_to_online_store,
 )
 from feast.infra.offline_stores.contrib.spark_offline_store.spark import (
     SparkOfflineStore,
@@ -316,6 +317,91 @@ def test_map_in_pandas_dummy_yield_has_correct_schema():
         f"Expected column ['status'], got {list(df.columns)}"
     )
     assert df["status"].iloc[0] == 0
+
+
+def test_write_to_online_store_skips_empty_partitions():
+    """write_to_online_store must not call online_write_batch for empty partitions.
+
+    foreachPartition can be called with zero rows when a partition has no data
+    in the requested date window.  Calling online_write_batch on an empty table
+    would add unnecessary RPC round-trips (and could error for some stores).
+    """
+    from unittest.mock import MagicMock, patch
+
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import FloatType, StringType, StructField, StructType
+
+    spark = SparkSession.builder.master("local[1]").appName("test_write").getOrCreate()
+
+    schema = StructType(
+        [
+            StructField("review_id", StringType(), True),
+            StructField("val", FloatType(), True),
+        ]
+    )
+    df = spark.createDataFrame([], schema=schema)
+
+    mock_artifacts = MagicMock()
+    mock_online_store = MagicMock()
+    mock_fv = MagicMock()
+    mock_fv.entity_columns = []
+    mock_config = MagicMock()
+    mock_config.materialization_config.online_write_batch_size = None
+    mock_artifacts.unserialize.return_value = (
+        mock_fv,
+        mock_online_store,
+        MagicMock(),
+        mock_config,
+    )
+
+    write_to_online_store(df, mock_artifacts)
+
+    mock_online_store.online_write_batch.assert_not_called()
+    spark.stop()
+
+
+def test_write_to_online_store_calls_write_batch_for_nonempty_partition():
+    """write_to_online_store must call online_write_batch once per non-empty partition."""
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import FloatType, StringType, StructField, StructType
+
+    spark = SparkSession.builder.master("local[1]").appName("test_write2").getOrCreate()
+
+    schema = StructType(
+        [
+            StructField("review_id", StringType(), True),
+            StructField("val", FloatType(), True),
+        ]
+    )
+    df = spark.createDataFrame([("r1", 1.0), ("r2", 2.0)], schema=schema).repartition(
+        1
+    )
+
+    mock_artifacts = MagicMock()
+    mock_online_store = MagicMock()
+    mock_fv = MagicMock()
+    mock_fv.entity_columns = []
+    mock_fv.features = []
+    mock_fv.batch_source.timestamp_field = "val"
+    mock_fv.batch_source.created_timestamp_column = None
+    mock_config = MagicMock()
+    mock_config.materialization_config.online_write_batch_size = None
+    mock_config.entity_key_serialization_version = 3
+    mock_artifacts.unserialize.return_value = (
+        mock_fv,
+        mock_online_store,
+        MagicMock(),
+        mock_config,
+    )
+
+    with patch(
+        "feast.infra.compute_engines.spark.utils._convert_arrow_to_proto",
+        return_value=[],
+    ):
+        write_to_online_store(df, mock_artifacts)
+
+    mock_online_store.online_write_batch.assert_called_once()
+    spark.stop()
 
 
 if __name__ == "__main__":
