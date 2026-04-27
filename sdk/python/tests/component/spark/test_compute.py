@@ -15,7 +15,11 @@ from feast.infra.common.materialization_job import (
 from feast.infra.common.retrieval_task import HistoricalRetrievalTask
 from feast.infra.compute_engines.spark.compute import SparkComputeEngine
 from feast.infra.compute_engines.spark.job import SparkDAGRetrievalJob
-from feast.infra.compute_engines.spark.utils import _ensure_s3a_event_log_dir
+from feast.infra.compute_engines.spark.utils import (
+    _ensure_s3a_event_log_dir,
+    get_or_create_new_spark_session,
+    map_in_pandas,
+)
 from feast.infra.offline_stores.contrib.spark_offline_store.spark import (
     SparkOfflineStore,
 )
@@ -262,6 +266,56 @@ def test_ensure_s3a_event_log_dir_non_fatal_on_s3_error(mock_boto3):
 
     # Must not raise
     _ensure_s3a_event_log_dir(_base_conf("s3a://my-bucket/spark-events/"))
+
+
+def test_get_or_create_new_spark_session_applies_sql_configs_to_reused_session():
+    """SQL/Hadoop configs must be forwarded even when a SparkSession already exists.
+
+    SparkSession.getOrCreate() silently drops new spark_config overrides when
+    an active session is found.  get_or_create_new_spark_session() must apply
+    spark.sql.* and spark.hadoop.* settings via session.conf.set() afterward.
+    """
+    mock_session = MagicMock()
+    spark_config = {
+        "spark.sql.sources.useV1SourceList": "avro",
+        "spark.hadoop.fs.s3a.endpoint": "http://minio:9000",
+        "spark.executor.instances": "2",  # SparkContext-level key — must NOT be set
+    }
+
+    with patch(
+        "feast.infra.compute_engines.spark.utils.SparkSession"
+    ) as mock_spark_cls:
+        mock_spark_cls.getActiveSession.return_value = mock_session
+        mock_spark_cls.builder.config.return_value.getOrCreate.return_value = (
+            mock_session
+        )
+
+        result = get_or_create_new_spark_session(spark_config)
+
+    assert result is mock_session
+    set_calls = {call.args[0] for call in mock_session.conf.set.call_args_list}
+    assert "spark.sql.sources.useV1SourceList" in set_calls
+    assert "spark.hadoop.fs.s3a.endpoint" in set_calls
+    # SparkContext-level keys must not be forwarded via conf.set
+    assert "spark.executor.instances" not in set_calls
+
+
+def test_map_in_pandas_dummy_yield_has_correct_schema():
+    """map_in_pandas must yield a DataFrame with column 'status' (int), not an
+    integer-indexed column '0'.  The wrong column name causes
+    ArrowStreamPandasUDFSerializer._create_array to raise
+    AttributeError: 'list' object has no attribute 'dtype'."""
+    import pandas as pd
+
+    # Empty iterator — for-loop is skipped, only the sentinel row is yielded.
+    batches = list(map_in_pandas(iter([]), MagicMock()))
+    assert len(batches) == 1, "Expected exactly one sentinel batch"
+    df = batches[0]
+    assert isinstance(df, pd.DataFrame)
+    assert list(df.columns) == ["status"], (
+        f"Expected column ['status'], got {list(df.columns)}"
+    )
+    assert df["status"].iloc[0] == 0
 
 
 if __name__ == "__main__":
