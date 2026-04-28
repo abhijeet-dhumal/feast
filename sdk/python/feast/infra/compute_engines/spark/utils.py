@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Dict, Iterable, Literal, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, Literal, Optional
 
 import pandas as pd
 import pyarrow
@@ -17,6 +17,9 @@ try:
 except ImportError:
     boto3 = None  # type: ignore[assignment]
     BotoConfig = None  # type: ignore[assignment,misc]
+
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +124,22 @@ def get_or_create_new_spark_session(
             )
 
         spark_session = spark_builder.getOrCreate()
+
+    # Apply SQL-level and Hadoop configs even when reusing an existing session.
+    # SparkSession.getOrCreate() / getActiveSession() returns the existing session
+    # without forwarding new spark_config overrides (e.g. spark.sql.sources.useV1SourceList
+    # set in batch_engine config is silently dropped).  SparkContext-level keys
+    # (master, k8s.*, executor.*) can't change post-creation; only spark.sql.* and
+    # spark.hadoop.* are safe to set dynamically via session.conf.set().
+    if spark_config:
+        _RUNTIME_PREFIXES = ("spark.sql.", "spark.hadoop.")
+        for k, v in spark_config.items():
+            if any(k.startswith(p) for p in _RUNTIME_PREFIXES):
+                try:
+                    spark_session.conf.set(k, v)
+                except Exception:
+                    pass
+
     spark_session.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
     return spark_session
 
@@ -146,7 +165,7 @@ def map_in_arrow(
                 for entity in feature_view.entity_columns
             }
 
-            batch_size = repo_config.materialization_config.online_write_batch_size
+            batch_size = getattr(repo_config.materialization_config, "online_write_batch_size", None)
             # Single batch if None (backward compatible), otherwise use configured batch_size
             sub_batches = (
                 [table]
@@ -202,7 +221,7 @@ def map_in_pandas(iterator, serialized_artifacts: SerializedArtifacts):
             for entity in feature_view.entity_columns
         }
 
-        batch_size = repo_config.materialization_config.online_write_batch_size
+        batch_size = getattr(repo_config.materialization_config, "online_write_batch_size", None)
         # Single batch if None (backward compatible), otherwise use configured batch_size
         sub_batches = (
             [table]
@@ -220,6 +239,250 @@ def map_in_pandas(iterator, serialized_artifacts: SerializedArtifacts):
                 lambda x: None,
             )
 
-    yield pd.DataFrame(
-        [pd.Series(range(1, 2))]
-    )  # dummy result because mapInPandas needs to return something
+    # mapInPandas requires at least one yielded DataFrame matching the declared
+    # return schema ("status int").  pd.Series(range(1,2)) produces column '0'
+    # (integer-indexed), not "status", causing ArrowStreamPandasUDFSerializer
+    # to raise AttributeError: 'list' object has no attribute 'dtype'.
+    yield pd.DataFrame({"status": [0]})
+
+
+def write_to_online_store(
+    spark_df: "DataFrame",
+    serialized_artifacts: SerializedArtifacts,
+) -> None:
+    """Write a Spark DataFrame to the online store using foreachPartition.
+
+    Replaces ``spark_df.mapInArrow(map_in_arrow, schema).count()``.
+    When a ``WindowGroupLimitExec`` node is immediately upstream of a
+    ``MapInArrowExec``, Spark 3.5 routes the Python worker through the pandas
+    UDF serialiser branch regardless of the declared ``SQL_MAP_ARROW_ITER_UDF``
+    eval-type, causing::
+
+        AttributeError: 'list' object has no attribute 'dtype'
+
+    ``foreachPartition`` uses Python's pickle serialiser for Row objects — no
+    Arrow UDF bridge involved — so the issue does not arise.  Each partition is
+    reconstructed into an Arrow table via the declared DataFrame schema before
+    the proto conversion, preserving all column types (including
+    ``list<float32>`` for embedding vectors).
+    """
+    from pyspark.sql.pandas.types import to_arrow_schema
+
+    df_schema = spark_df.schema
+
+    def _write_partition(rows):  # type: ignore[type-arg]
+        rows_list = list(rows)
+        if not rows_list:
+            return
+
+        import pyarrow as pa
+        from feast.utils import _convert_arrow_to_proto
+
+        pdf = pd.DataFrame([r.asDict(recursive=True) for r in rows_list])
+        table = pa.Table.from_pandas(
+            pdf, schema=to_arrow_schema(df_schema), preserve_index=False
+        )
+
+        (
+            feature_view,
+            online_store,
+            _,
+            repo_config,
+        ) = serialized_artifacts.unserialize()
+
+        join_key_to_value_type = {
+            entity.name: entity.dtype.to_value_type()
+            for entity in feature_view.entity_columns
+        }
+
+        batch_size = getattr(
+            repo_config.materialization_config, "online_write_batch_size", None
+        )
+        if batch_size is None:
+            sub_tables = [table]
+        else:
+            sub_tables = [
+                table.slice(offset, min(batch_size, len(table) - offset))
+                for offset in range(0, len(table), batch_size)
+            ]
+
+        for sub_table in sub_tables:
+            online_store.online_write_batch(
+                config=repo_config,
+                table=feature_view,
+                data=_convert_arrow_to_proto(sub_table, feature_view, join_key_to_value_type),
+                progress=lambda x: None,
+            )
+
+    spark_df.foreachPartition(_write_partition)
+
+
+def write_to_offline_store(
+    spark_df: "DataFrame",
+    serialized_artifacts: SerializedArtifacts,
+) -> None:
+    """Write a Spark DataFrame to the offline store using foreachPartition.
+
+    Same motivation as ``write_to_online_store`` — avoids the
+    ``ArrowStreamPandasUDFSerializer`` serialiser mismatch that affects
+    the previous ``mapInArrow`` implementation.
+    """
+    from pyspark.sql.pandas.types import to_arrow_schema
+
+    df_schema = spark_df.schema
+
+    def _write_partition(rows):  # type: ignore[type-arg]
+        rows_list = list(rows)
+        if not rows_list:
+            return
+
+        import pyarrow as pa
+
+        pdf = pd.DataFrame([r.asDict(recursive=True) for r in rows_list])
+        table = pa.Table.from_pandas(
+            pdf, schema=to_arrow_schema(df_schema), preserve_index=False
+        )
+
+        (
+            feature_view,
+            _,
+            offline_store,
+            repo_config,
+        ) = serialized_artifacts.unserialize()
+
+        offline_store.offline_write_batch(
+            config=repo_config,
+            feature_view=feature_view,
+            table=table,
+            progress=lambda x: None,
+        )
+
+    spark_df.foreachPartition(_write_partition)
+
+
+# Module-level embedding-model cache: keyed by (model_id, device_str).
+# Lives for the lifetime of the executor Python process (one JVM worker per
+# core), so the model is loaded at most once per executor even across multiple
+# partition calls.
+_FEAST_EMBED_MODEL_CACHE: Dict[tuple, object] = {}
+
+
+def spark_embed(
+    df: "DataFrame",
+    text_col: str,
+    model: str = "sentence-transformers/all-MiniLM-L6-v2",
+    output_col: str = "embedding",
+    batch_size: int = 64,
+) -> "DataFrame":
+    """Append a float-array embedding column to *df* using a sentence-transformer.
+
+    Designed for use inside a Feast ``@batch_feature_view`` transformation with
+    ``TransformationMode.PYTHON`` and a ``SparkComputeEngine``.
+
+    Architecture
+    ------------
+    * Uses ``rdd.mapPartitions()`` (Python pickle serialisation) instead of
+      ``mapInArrow`` / pandas UDFs.  When ``WindowGroupLimitExec`` is
+      immediately downstream, Arrow-UDF-backed DataFrames are routed through
+      ``ArrowStreamPandasUDFSerializer`` instead of ``ArrowStreamUDFSerializer``,
+      causing ``AttributeError: 'list' object has no attribute 'dtype'``.
+      ``rdd.mapPartitions()`` has no Arrow UDF bridge, so the issue cannot arise.
+
+    * A ``repartition()`` call follows ``mapPartitions().toDF()`` to insert a
+      shuffle-based ``Exchange`` node in the physical plan.  This creates a hard
+      Spark stage boundary between embedding generation and any downstream
+      ``WindowGroupLimitExec`` (dedup) — cheaper than ``persist().count()``
+      because no data is materialised to memory/disk.
+
+    * ``SentenceTransformer`` is loaded once per executor process via a
+      module-level dict (``_FEAST_EMBED_MODEL_CACHE``).  On GPU executors the
+      model lands on CUDA automatically; on CPU executors it stays on CPU.
+      Subsequent partitions on the same executor reuse the cached instance.
+
+    Parameters
+    ----------
+    df:
+        Input Spark DataFrame.  Must contain a column named *text_col*.
+    text_col:
+        Name of the string column to embed.
+    model:
+        HuggingFace model ID or local path passed to ``SentenceTransformer``.
+    output_col:
+        Name of the output ``ArrayType(FloatType())`` column appended to *df*.
+    batch_size:
+        Inference batch size forwarded to ``SentenceTransformer.encode()``.
+
+    Returns
+    -------
+    DataFrame
+        *df* with *output_col* appended (``array<float>``).
+
+    Example
+    -------
+    .. code-block:: python
+
+        @batch_feature_view(
+            name="review_embeddings",
+            schema=[..., Field(name="embedding", dtype=Array(Float32),
+                               vector_index=True, vector_search_metric="COSINE")],
+            source=my_spark_source,
+            mode=TransformationMode.PYTHON,
+            online=True,
+        )
+        def review_embeddings(df):
+            from feast.infra.compute_engines.spark.utils import spark_embed
+            return spark_embed(df, text_col="review_text")
+    """
+    import pyspark.sql.types as T
+
+    col_names = df.columns
+    model_id = model
+    bs = batch_size
+    t_col = text_col
+
+    out_schema = T.StructType(
+        list(df.schema.fields)
+        + [T.StructField(output_col, T.ArrayType(T.FloatType()), True)]
+    )
+
+    def _embed_partition(rows):
+        import torch
+        from sentence_transformers import SentenceTransformer
+
+        rows_list = list(rows)
+        if not rows_list:
+            return iter([])
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        cache_key = (model_id, device)
+        if cache_key not in _FEAST_EMBED_MODEL_CACHE:
+            _FEAST_EMBED_MODEL_CACHE[cache_key] = SentenceTransformer(
+                model_id, device=device
+            )
+        sent_model = _FEAST_EMBED_MODEL_CACHE[cache_key]
+
+        texts = [str(getattr(r, t_col, "") or "") for r in rows_list]
+        embeddings = sent_model.encode(texts, batch_size=bs, show_progress_bar=False)
+
+        result = []
+        for row, emb in zip(rows_list, embeddings):
+            result.append(
+                tuple(getattr(row, c) for c in col_names)
+                + (emb.astype("float32").tolist(),)
+            )
+        return iter(result)
+
+    embedded = df.rdd.mapPartitions(_embed_partition).toDF(out_schema)
+
+    # Force an Exchange node between the embedding RDD and any downstream window
+    # function.  Without this, Spark fuses the Python RDD stage and the
+    # WindowGroupLimitExec shuffle into one stage, routing through
+    # ArrowStreamPandasUDFSerializer which fails on list<float32> columns.
+    # repartition() inserts a hard barrier without materialising data to memory.
+    spark = SparkSession.getActiveSession()
+    n_parts = (
+        spark.sparkContext.defaultParallelism
+        if spark is not None
+        else df.rdd.getNumPartitions()
+    )
+    return embedded.repartition(n_parts)
