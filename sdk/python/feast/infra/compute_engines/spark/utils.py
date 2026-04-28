@@ -388,13 +388,15 @@ def spark_embed(
       causing ``AttributeError: 'list' object has no attribute 'dtype'``.
       ``rdd.mapPartitions()`` has no Arrow UDF bridge, so the issue cannot arise.
 
-    * ``checkpoint(eager=True)`` follows ``mapPartitions().toDF()`` to completely
-      sever Python RDD lineage.  Neither ``repartition()`` (eliminated by AQE) nor
-      ``persist().count()`` (CacheManager skips ``LogicalRDD`` under AQE) reliably
-      prevents ``PythonArrowOutput`` from appearing in downstream physical plans.
-      ``checkpoint`` writes to a temp dir and returns a plan with zero Python
-      ancestry, so ``WindowGroupLimitExec`` and ``foreachPartition`` see only JVM
-      InternalRow data.
+    * ``localCheckpoint(eager=True)`` follows ``mapPartitions().toDF()`` to
+      completely sever Python RDD lineage.  Neither ``repartition()`` (eliminated
+      by AQE) nor ``persist().count()`` (CacheManager skips ``LogicalRDD`` under
+      AQE) reliably prevents ``PythonArrowOutput`` from appearing in downstream
+      physical plans.  ``localCheckpoint`` forces computation, stores results in
+      Spark's executor BlockStore (auto-released on SparkContext stop — no temp
+      files), and returns a plan with zero Python ancestry, so
+      ``WindowGroupLimitExec`` and ``foreachPartition`` see only JVM InternalRow
+      data.
 
     * ``SentenceTransformer`` is loaded once per executor process via a
       module-level dict (``_FEAST_EMBED_MODEL_CACHE``).  On GPU executors the
@@ -489,16 +491,17 @@ def spark_embed(
     #     CacheManager.useCachedData() skips LogicalRDD nodes, so PythonArrowOutput
     #     remains in every downstream physical plan.
     #
-    # checkpoint(eager=True) is the only guaranteed solution:
+    # localCheckpoint(eager=True) is the only guaranteed solution:
     #   - Forces synchronous execution of the entire plan including the Python RDD
-    #   - Writes results to the checkpoint directory as binary InternalRow files
+    #   - Stores results in Spark executor BlockStore (memory / local disk) — no
+    #     HDFS or filesystem path required, no manual cleanup needed
     #   - Returns a brand-new DataFrame whose logical plan is ONLY
-    #     ReliableCheckpointRelation — zero Python ancestry
+    #     LocalCheckpointRelation — zero Python ancestry
     #   - Downstream window / foreachPartition plans contain no Python nodes at all
-    import uuid
-
-    spark = SparkSession.getActiveSession()
-    if spark is not None:
-        ckpt_dir = f"/tmp/feast-embed-ckpt-{uuid.uuid4().hex}"
-        spark.sparkContext.setCheckpointDir(ckpt_dir)
-    return embedded.checkpoint(eager=True)
+    #   - BlockStore data is automatically released when SparkContext stops
+    #
+    # Why not checkpoint(eager=True)?  That variant writes to
+    # SparkContext.checkpointDir (must be HDFS-compatible), which requires extra
+    # configuration and leaves files on disk that need manual cleanup.
+    # localCheckpoint uses in-process BlockManager storage instead.
+    return embedded.localCheckpoint(eager=True)
