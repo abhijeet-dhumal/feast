@@ -427,7 +427,10 @@ def test_spark_embed_model_singleton_per_executor():
     assert len(rows) == 3
     for row in rows:
         assert row.embedding is not None
+    # Model constructed exactly once (singleton cache)
     mock_cls.assert_called_once_with("test-model", device="cpu")
+    # persist().count() materialised the data; original RDD lineage is gone
+    assert result.is_cached
 
     spark.stop()
     spark_utils._FEAST_EMBED_MODEL_CACHE.clear()

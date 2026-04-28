@@ -474,15 +474,20 @@ def spark_embed(
 
     embedded = df.rdd.mapPartitions(_embed_partition).toDF(out_schema)
 
-    # Force an Exchange node between the embedding RDD and any downstream window
-    # function.  Without this, Spark fuses the Python RDD stage and the
-    # WindowGroupLimitExec shuffle into one stage, routing through
-    # ArrowStreamPandasUDFSerializer which fails on list<float32> columns.
-    # repartition() inserts a hard barrier without materialising data to memory.
-    spark = SparkSession.getActiveSession()
-    n_parts = (
-        spark.sparkContext.defaultParallelism
-        if spark is not None
-        else df.rdd.getNumPartitions()
-    )
-    return embedded.repartition(n_parts)
+    # Force a concrete stage break BEFORE any downstream window / shuffle node.
+    #
+    # repartition() alone is insufficient: AQE (spark.sql.adaptive.enabled=true)
+    # coalesces the RoundRobin Exchange with the downstream dedup-window Exchange
+    # into a single shuffle, leaving PythonArrowOutput fused with
+    # WindowGroupLimitExec in the same stage.  The combined stage is then driven
+    # by ArrowStreamPandasUDFSerializer which fails on list<float32> embedding
+    # columns with:  AttributeError: 'list' object has no attribute 'dtype'
+    #
+    # persist().count() is an action — it materialises the RDD to Spark's
+    # in-memory block store as JVM-native InternalRow format, completely severing
+    # the Python RDD / PythonArrowOutput lineage.  Downstream window functions
+    # and foreachPartition reads work from InternalRows; no Python worker involved
+    # and the serialiser issue cannot arise.
+    embedded.persist()
+    embedded.count()
+    return embedded
