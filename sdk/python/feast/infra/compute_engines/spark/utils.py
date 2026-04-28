@@ -388,15 +388,15 @@ def spark_embed(
       causing ``AttributeError: 'list' object has no attribute 'dtype'``.
       ``rdd.mapPartitions()`` has no Arrow UDF bridge, so the issue cannot arise.
 
-    * ``localCheckpoint(eager=True)`` follows ``mapPartitions().toDF()`` to
-      completely sever Python RDD lineage.  Neither ``repartition()`` (eliminated
-      by AQE) nor ``persist().count()`` (CacheManager skips ``LogicalRDD`` under
-      AQE) reliably prevents ``PythonArrowOutput`` from appearing in downstream
-      physical plans.  ``localCheckpoint`` forces computation, stores results in
-      Spark's executor BlockStore (auto-released on SparkContext stop — no temp
-      files), and returns a plan with zero Python ancestry, so
-      ``WindowGroupLimitExec`` and ``foreachPartition`` see only JVM InternalRow
-      data.
+    * ``write.parquet(tmp) + read.parquet(tmp)`` follows ``mapPartitions().toDF()``
+      to completely sever Python RDD lineage.  ``repartition()``,
+      ``persist().count()``, and ``localCheckpoint(eager=True)`` all fail in
+      PySpark 3.5 because Spark still routes the computation through
+      ``PythonArrowOutput`` + ``ArrowStreamPandasUDFSerializer``, which breaks on
+      ``list<float32>`` embedding columns.  Writing to a local Parquet file and
+      reading it back produces a ``FileSourceScan`` — no Python ancestry, no Arrow
+      UDF serialiser involved — and ``atexit`` cleans up the temp dir when the
+      materialize process exits.
 
     * ``SentenceTransformer`` is loaded once per executor process via a
       module-level dict (``_FEAST_EMBED_MODEL_CACHE``).  On GPU executors the
@@ -480,28 +480,29 @@ def spark_embed(
 
     # Completely sever Python RDD lineage before any downstream window / shuffle.
     #
-    # Neither repartition() nor persist().count() works:
+    # repartition(), persist().count(), localCheckpoint(eager=True) all fail:
     #   - repartition(): AQE coalesces the RoundRobin Exchange with the downstream
-    #     dedup Exchange, leaving PythonArrowOutput fused with WindowGroupLimitExec
-    #     in the same ShuffleMapTask.  The combined stage uses
-    #     ArrowStreamPandasUDFSerializer which fails on list<float32> columns:
+    #     dedup Exchange so PythonArrowOutput stays fused with WindowGroupLimitExec.
+    #   - persist().count(): CacheManager.useCachedData() skips LogicalRDD nodes,
+    #     PythonArrowOutput remains in every downstream physical plan.
+    #   - localCheckpoint(eager=True): despite Scala-level lineage truncation,
+    #     PySpark 3.5 still routes the checkpoint execution through PythonArrowOutput
+    #     + ArrowStreamPandasUDFSerializer which fails on list<float32>:
     #       AttributeError: 'list' object has no attribute 'dtype'
-    #   - persist().count(): PySpark 3.5 does NOT substitute InMemoryTableScan for
-    #     Python-RDD-backed DataFrames in downstream logical plans under AQE.
-    #     CacheManager.useCachedData() skips LogicalRDD nodes, so PythonArrowOutput
-    #     remains in every downstream physical plan.
     #
-    # localCheckpoint(eager=True) is the only guaranteed solution:
-    #   - Forces synchronous execution of the entire plan including the Python RDD
-    #   - Stores results in Spark executor BlockStore (memory / local disk) — no
-    #     HDFS or filesystem path required, no manual cleanup needed
-    #   - Returns a brand-new DataFrame whose logical plan is ONLY
-    #     LocalCheckpointRelation — zero Python ancestry
-    #   - Downstream window / foreachPartition plans contain no Python nodes at all
-    #   - BlockStore data is automatically released when SparkContext stops
-    #
-    # Why not checkpoint(eager=True)?  That variant writes to
-    # SparkContext.checkpointDir (must be HDFS-compatible), which requires extra
-    # configuration and leaves files on disk that need manual cleanup.
-    # localCheckpoint uses in-process BlockManager storage instead.
-    return embedded.localCheckpoint(eager=True)
+    # Writing to a temp Parquet file and reading back is the ONLY approach that
+    # reliably produces a FileSourceScan with zero Python ancestry:
+    #   1. embedded.write.parquet(tmp) forces the Python RDD computation and emits
+    #      Parquet files that Spark reads back as pure JVM FileSourceScan nodes.
+    #   2. The returned DataFrame has no trace of PythonArrowOutput anywhere.
+    #   3. Downstream WindowGroupLimitExec + foreachPartition read from Parquet.
+    #   4. atexit cleans up the temp directory when the materialize process exits.
+    import atexit
+    import shutil
+    import uuid
+
+    spark = SparkSession.getActiveSession()
+    tmp_path = f"/tmp/feast-embed-{uuid.uuid4().hex}"
+    embedded.write.parquet(tmp_path)
+    atexit.register(shutil.rmtree, tmp_path, True)
+    return spark.read.parquet(tmp_path)
