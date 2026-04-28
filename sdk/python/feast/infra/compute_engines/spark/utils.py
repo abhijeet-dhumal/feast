@@ -441,10 +441,6 @@ def spark_embed(
             from feast.infra.compute_engines.spark.utils import spark_embed
             return spark_embed(df, text_col="review_text")
     """
-    import atexit
-    import shutil
-    import uuid
-
     import pandas as pd
     import pyspark.sql.functions as F
     from pyspark.sql.functions import pandas_udf
@@ -476,12 +472,20 @@ def spark_embed(
 
     embedded = df.withColumn(output_col, _embed_udf(F.col(t_col)))
 
-    # Sever Python lineage: write.parquet now succeeds because the pandas_udf
-    # returns pd.Series, not raw Python tuples.  read.parquet returns a pure
-    # FileSourceScan — downstream WindowGroupLimitExec + foreachPartition have
-    # zero Python ancestry and no Arrow serialiser issues.
-    spark = SparkSession.getActiveSession()
-    tmp_path = f"/tmp/feast-embed-{uuid.uuid4().hex}"
-    embedded.write.parquet(tmp_path)
-    atexit.register(shutil.rmtree, tmp_path, True)
-    return spark.read.parquet(tmp_path)
+    # Sever Python lineage via localCheckpoint(eager=True).
+    #
+    # write.parquet()+read.parquet() does NOT reliably break the plan when
+    # spark.sql.sources.useV1SourceList includes "parquet" and AQE is enabled
+    # (spark.sql.adaptive.enabled=true): WindowGroupLimitExec in Stage 1 can
+    # still read from PythonArrowOutput instead of FileSourceScan, triggering:
+    #   AttributeError: 'list' object has no attribute 'dtype'
+    #
+    # localCheckpoint(eager=True) truncates ALL Python lineage unconditionally:
+    #   1. Runs the pandas_udf now (Stage 0) — serialises correctly because
+    #      wrap_scalar_pandas_udf yields [pd.Series] (standard scalar path).
+    #   2. Materialises every partition into executor block-storage (local JVM).
+    #   3. Returns a DataFrame backed by ExternalRDDScan — zero Python ancestry.
+    #
+    # Downstream Window / foreachPartition read pure Java InternalRow objects;
+    # no Arrow UDF serialiser is involved at all.
+    return embedded.localCheckpoint(eager=True)
