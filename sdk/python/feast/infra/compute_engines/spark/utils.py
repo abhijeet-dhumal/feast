@@ -381,22 +381,26 @@ def spark_embed(
 
     Architecture
     ------------
-    * Uses ``rdd.mapPartitions()`` (Python pickle serialisation) instead of
-      ``mapInArrow`` / pandas UDFs.  When ``WindowGroupLimitExec`` is
-      immediately downstream, Arrow-UDF-backed DataFrames are routed through
-      ``ArrowStreamPandasUDFSerializer`` instead of ``ArrowStreamUDFSerializer``,
-      causing ``AttributeError: 'list' object has no attribute 'dtype'``.
-      ``rdd.mapPartitions()`` has no Arrow UDF bridge, so the issue cannot arise.
+    * Uses ``@pandas_udf(ArrayType(FloatType()))`` instead of
+      ``rdd.mapPartitions().toDF()``.
 
-    * ``write.parquet(tmp) + read.parquet(tmp)`` follows ``mapPartitions().toDF()``
-      to completely sever Python RDD lineage.  ``repartition()``,
-      ``persist().count()``, and ``localCheckpoint(eager=True)`` all fail in
-      PySpark 3.5 because Spark still routes the computation through
-      ``PythonArrowOutput`` + ``ArrowStreamPandasUDFSerializer``, which breaks on
-      ``list<float32>`` embedding columns.  Writing to a local Parquet file and
-      reading it back produces a ``FileSourceScan`` — no Python ancestry, no Arrow
-      UDF serialiser involved — and ``atexit`` cleans up the temp dir when the
-      materialize process exits.
+      In PySpark 3.5 (SPARK-44991), ``createDataFrame(rdd, schema)`` with
+      ``spark.sql.execution.arrow.pyspark.enabled=true`` routes through
+      ``ArrowEvalPythonExec`` / ``PythonArrowOutput``.  The Arrow serialiser calls
+      ``_create_array(series, ArrayType(FloatType()))`` expecting a ``pd.Series``,
+      but ``mapPartitions`` yields Python tuples so the serialiser receives a raw
+      Python ``list`` → ``AttributeError: 'list' object has no attribute 'dtype'``.
+
+      ``@pandas_udf`` explicitly returns ``pd.Series([[0.1,...], [0.2,...]])``
+      (dtype=object).  The serialiser receives a proper ``pd.Series``;
+      ``series.dtype = dtype('O')`` and
+      ``pa.Array.from_pandas(series, type=pa.list_(pa.float32()))`` succeeds.
+
+    * ``write.parquet(tmp) + read.parquet(tmp)`` severs Python lineage.  After the
+      Parquet round-trip, ``read.parquet`` returns a ``FileSourceScan`` with zero
+      Python ancestry.  Downstream ``WindowGroupLimitExec`` (SparkDedupNode) and
+      ``foreachPartition`` (SparkWriteNode) read from Parquet — no Arrow UDF
+      serialiser involved.  ``atexit`` cleans up the temp dir on process exit.
 
     * ``SentenceTransformer`` is loaded once per executor process via a
       module-level dict (``_FEAST_EMBED_MODEL_CACHE``).  On GPU executors the
@@ -437,70 +441,45 @@ def spark_embed(
             from feast.infra.compute_engines.spark.utils import spark_embed
             return spark_embed(df, text_col="review_text")
     """
-    import pyspark.sql.types as T
-
-    col_names = df.columns
-    model_id = model
-    bs = batch_size
-    t_col = text_col
-
-    out_schema = T.StructType(
-        list(df.schema.fields)
-        + [T.StructField(output_col, T.ArrayType(T.FloatType()), True)]
-    )
-
-    def _embed_partition(rows):
-        import torch
-        from sentence_transformers import SentenceTransformer
-
-        rows_list = list(rows)
-        if not rows_list:
-            return iter([])
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        cache_key = (model_id, device)
-        if cache_key not in _FEAST_EMBED_MODEL_CACHE:
-            _FEAST_EMBED_MODEL_CACHE[cache_key] = SentenceTransformer(
-                model_id, device=device
-            )
-        sent_model = _FEAST_EMBED_MODEL_CACHE[cache_key]
-
-        texts = [str(getattr(r, t_col, "") or "") for r in rows_list]
-        embeddings = sent_model.encode(texts, batch_size=bs, show_progress_bar=False)
-
-        result = []
-        for row, emb in zip(rows_list, embeddings):
-            result.append(
-                tuple(getattr(row, c) for c in col_names)
-                + (emb.astype("float32").tolist(),)
-            )
-        return iter(result)
-
-    embedded = df.rdd.mapPartitions(_embed_partition).toDF(out_schema)
-
-    # Completely sever Python RDD lineage before any downstream window / shuffle.
-    #
-    # repartition(), persist().count(), localCheckpoint(eager=True) all fail:
-    #   - repartition(): AQE coalesces the RoundRobin Exchange with the downstream
-    #     dedup Exchange so PythonArrowOutput stays fused with WindowGroupLimitExec.
-    #   - persist().count(): CacheManager.useCachedData() skips LogicalRDD nodes,
-    #     PythonArrowOutput remains in every downstream physical plan.
-    #   - localCheckpoint(eager=True): despite Scala-level lineage truncation,
-    #     PySpark 3.5 still routes the checkpoint execution through PythonArrowOutput
-    #     + ArrowStreamPandasUDFSerializer which fails on list<float32>:
-    #       AttributeError: 'list' object has no attribute 'dtype'
-    #
-    # Writing to a temp Parquet file and reading back is the ONLY approach that
-    # reliably produces a FileSourceScan with zero Python ancestry:
-    #   1. embedded.write.parquet(tmp) forces the Python RDD computation and emits
-    #      Parquet files that Spark reads back as pure JVM FileSourceScan nodes.
-    #   2. The returned DataFrame has no trace of PythonArrowOutput anywhere.
-    #   3. Downstream WindowGroupLimitExec + foreachPartition read from Parquet.
-    #   4. atexit cleans up the temp directory when the materialize process exits.
     import atexit
     import shutil
     import uuid
 
+    import pandas as pd
+    import pyspark.sql.functions as F
+    from pyspark.sql.functions import pandas_udf
+    import pyspark.sql.types as T
+
+    model_id = model
+    bs = batch_size
+    t_col = text_col
+    _cache = _FEAST_EMBED_MODEL_CACHE
+
+    # @pandas_udf returns pd.Series — ArrowStreamPandasUDFSerializer receives a
+    # proper pd.Series (dtype=object) rather than a raw Python list, so
+    # series.dtype succeeds and pa.Array.from_pandas handles list<float32> correctly.
+    @pandas_udf(T.ArrayType(T.FloatType()))
+    def _embed_udf(texts: pd.Series) -> pd.Series:
+        import torch
+        from sentence_transformers import SentenceTransformer
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        cache_key = (model_id, device)
+        if cache_key not in _cache:
+            _cache[cache_key] = SentenceTransformer(model_id, device=device)
+        sent_model = _cache[cache_key]
+
+        embeddings = sent_model.encode(
+            texts.tolist(), batch_size=bs, show_progress_bar=False
+        )
+        return pd.Series([e.astype("float32").tolist() for e in embeddings])
+
+    embedded = df.withColumn(output_col, _embed_udf(F.col(t_col)))
+
+    # Sever Python lineage: write.parquet now succeeds because the pandas_udf
+    # returns pd.Series, not raw Python tuples.  read.parquet returns a pure
+    # FileSourceScan — downstream WindowGroupLimitExec + foreachPartition have
+    # zero Python ancestry and no Arrow serialiser issues.
     spark = SparkSession.getActiveSession()
     tmp_path = f"/tmp/feast-embed-{uuid.uuid4().hex}"
     embedded.write.parquet(tmp_path)
