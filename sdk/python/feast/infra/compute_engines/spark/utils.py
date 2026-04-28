@@ -388,11 +388,13 @@ def spark_embed(
       causing ``AttributeError: 'list' object has no attribute 'dtype'``.
       ``rdd.mapPartitions()`` has no Arrow UDF bridge, so the issue cannot arise.
 
-    * A ``repartition()`` call follows ``mapPartitions().toDF()`` to insert a
-      shuffle-based ``Exchange`` node in the physical plan.  This creates a hard
-      Spark stage boundary between embedding generation and any downstream
-      ``WindowGroupLimitExec`` (dedup) — cheaper than ``persist().count()``
-      because no data is materialised to memory/disk.
+    * ``checkpoint(eager=True)`` follows ``mapPartitions().toDF()`` to completely
+      sever Python RDD lineage.  Neither ``repartition()`` (eliminated by AQE) nor
+      ``persist().count()`` (CacheManager skips ``LogicalRDD`` under AQE) reliably
+      prevents ``PythonArrowOutput`` from appearing in downstream physical plans.
+      ``checkpoint`` writes to a temp dir and returns a plan with zero Python
+      ancestry, so ``WindowGroupLimitExec`` and ``foreachPartition`` see only JVM
+      InternalRow data.
 
     * ``SentenceTransformer`` is loaded once per executor process via a
       module-level dict (``_FEAST_EMBED_MODEL_CACHE``).  On GPU executors the
@@ -474,20 +476,29 @@ def spark_embed(
 
     embedded = df.rdd.mapPartitions(_embed_partition).toDF(out_schema)
 
-    # Force a concrete stage break BEFORE any downstream window / shuffle node.
+    # Completely sever Python RDD lineage before any downstream window / shuffle.
     #
-    # repartition() alone is insufficient: AQE (spark.sql.adaptive.enabled=true)
-    # coalesces the RoundRobin Exchange with the downstream dedup-window Exchange
-    # into a single shuffle, leaving PythonArrowOutput fused with
-    # WindowGroupLimitExec in the same stage.  The combined stage is then driven
-    # by ArrowStreamPandasUDFSerializer which fails on list<float32> embedding
-    # columns with:  AttributeError: 'list' object has no attribute 'dtype'
+    # Neither repartition() nor persist().count() works:
+    #   - repartition(): AQE coalesces the RoundRobin Exchange with the downstream
+    #     dedup Exchange, leaving PythonArrowOutput fused with WindowGroupLimitExec
+    #     in the same ShuffleMapTask.  The combined stage uses
+    #     ArrowStreamPandasUDFSerializer which fails on list<float32> columns:
+    #       AttributeError: 'list' object has no attribute 'dtype'
+    #   - persist().count(): PySpark 3.5 does NOT substitute InMemoryTableScan for
+    #     Python-RDD-backed DataFrames in downstream logical plans under AQE.
+    #     CacheManager.useCachedData() skips LogicalRDD nodes, so PythonArrowOutput
+    #     remains in every downstream physical plan.
     #
-    # persist().count() is an action — it materialises the RDD to Spark's
-    # in-memory block store as JVM-native InternalRow format, completely severing
-    # the Python RDD / PythonArrowOutput lineage.  Downstream window functions
-    # and foreachPartition reads work from InternalRows; no Python worker involved
-    # and the serialiser issue cannot arise.
-    embedded.persist()
-    embedded.count()
-    return embedded
+    # checkpoint(eager=True) is the only guaranteed solution:
+    #   - Forces synchronous execution of the entire plan including the Python RDD
+    #   - Writes results to the checkpoint directory as binary InternalRow files
+    #   - Returns a brand-new DataFrame whose logical plan is ONLY
+    #     ReliableCheckpointRelation — zero Python ancestry
+    #   - Downstream window / foreachPartition plans contain no Python nodes at all
+    import uuid
+
+    spark = SparkSession.getActiveSession()
+    if spark is not None:
+        ckpt_dir = f"/tmp/feast-embed-ckpt-{uuid.uuid4().hex}"
+        spark.sparkContext.setCheckpointDir(ckpt_dir)
+    return embedded.checkpoint(eager=True)
